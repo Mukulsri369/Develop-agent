@@ -2,6 +2,8 @@ import { createClient } from "@supabase/supabase-js";
 import { queryOptions } from "@tanstack/react-query";
 import type { Database } from "@/integrations/supabase/types";
 import { productCategoryIds } from "./product-categories";
+import { LEGACY_STORE_ID } from "@/platform/tenancy/constants";
+import { StoreSettingsService } from "@/platform/settings/service";
 
 export const SITE_URL =
   (import.meta.env?.["VITE_SITE_URL"] as string | undefined) ??
@@ -186,29 +188,33 @@ export function shuffleArray<T>(items: readonly T[]): T[] {
   return result;
 }
 
-function liveProducts() {
-  return publicDb()
+export function liveProducts(storeId: string = LEGACY_STORE_ID) {
+  let query = publicDb()
     .from("products")
     .select(CARD_SELECT, { count: "exact" })
     .eq("active", true)
     .is("deleted_at", null);
+
+  if (storeId && storeId !== LEGACY_STORE_ID) {
+    query = query.eq("store_id", storeId);
+  }
+
+  return query;
 }
 
 // ---------- Queries ----------
 
-export const settingsQuery = queryOptions({
-  queryKey: ["settings"],
-  queryFn: async () => {
-    const { data, error } = await publicDb()
-      .from("public_site_settings")
-      .select("*")
-      .eq("id", 1)
-      .maybeSingle();
-    if (error) throw error;
-    return data ? { ...data, contact_email: null } : null;
-  },
-  staleTime: 60_000,
-});
+export function createSettingsQuery(storeId: string = LEGACY_STORE_ID) {
+  return queryOptions({
+    queryKey: ["settings", storeId],
+    queryFn: async () => {
+      return StoreSettingsService.getPublicSettings(storeId);
+    },
+    staleTime: 60_000,
+  });
+}
+
+export const settingsQuery = createSettingsQuery(LEGACY_STORE_ID);
 
 export const LEGACY_CATEGORY_SLUG_MAP: Record<string, string> = {
   lights: "cosmic-lighting",
@@ -230,20 +236,35 @@ export const LEGACY_CATEGORY_SLUG_MAP: Record<string, string> = {
   "astronomy-apparel": "space-decor",
 };
 
-export const categoriesQuery = queryOptions({
-  queryKey: ["categories", "public"],
-  queryFn: async () => {
-    const { data, error } = await publicDb()
-      .from("categories")
-      .select("*")
-      .eq("active", true)
-      .order("sort_order")
-      .order("name");
-    if (error) throw error;
-    return data ?? [];
-  },
-  staleTime: 60_000,
-});
+export function createCategoriesQuery(storeId: string = LEGACY_STORE_ID) {
+  return queryOptions({
+    queryKey: ["categories", "public", storeId],
+    queryFn: async () => {
+      let query = publicDb()
+        .from("categories")
+        .select("*")
+        .eq("active", true)
+        .order("sort_order")
+        .order("name");
+
+      if (storeId && storeId !== LEGACY_STORE_ID) {
+        query = query.eq("store_id", storeId);
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        if (error.code === "42703") {
+          return [];
+        }
+        throw error;
+      }
+      return data ?? [];
+    },
+    staleTime: 60_000,
+  });
+}
+
+export const categoriesQuery = createCategoriesQuery(LEGACY_STORE_ID);
 
 export type FestivalSpecialConfig = {
   product_ids?: string[];
@@ -253,36 +274,30 @@ export type FestivalSpecialConfig = {
   enabled?: boolean;
 };
 
-export async function fetchFestivalProducts(): Promise<ProductCardData[]> {
+export async function fetchFestivalProducts(
+  storeId: string = LEGACY_STORE_ID,
+): Promise<ProductCardData[]> {
   try {
     const db = publicDb();
 
-    // 1. Check if configured in site_settings (via public_site_settings view)
-    const { data: settingsRow } = await db
-      .from("public_site_settings")
-      .select("social_links")
-      .eq("id", 1)
-      .maybeSingle();
+    // 1. Check if configured in store_settings
+    const storeSettings = await StoreSettingsService.getPublicSettings(storeId).catch(() => null);
+    const festSpecial = storeSettings?.promotions?.festival_special;
 
-    const social = (settingsRow?.social_links as Record<string, unknown> | null) || {};
-    const festSpecial = (social.festival_special as Record<string, unknown> | undefined) || {};
-
-    // If admin explicitly disabled festival section, return empty list
-    if (festSpecial.enabled === false) {
+    if (festSpecial && festSpecial.enabled === false) {
       return [];
     }
 
-    const configuredIds: string[] | null = Array.isArray(social.festival_product_ids)
-      ? (social.festival_product_ids as string[])
-      : Array.isArray(festSpecial.product_ids)
-        ? (festSpecial.product_ids as string[])
+    const configuredIds: string[] | null =
+      festSpecial?.product_ids && festSpecial.product_ids.length > 0
+        ? festSpecial.product_ids
         : null;
 
     if (configuredIds !== null) {
       if (configuredIds.length === 0) {
         return [];
       }
-      const { data: products } = await liveProducts().in("id", configuredIds);
+      const { data: products } = await liveProducts(storeId).in("id", configuredIds);
       if (products && products.length > 0) {
         const productMap = new Map<string, RawCard>();
         for (const p of products as unknown as RawCard[]) {
@@ -312,7 +327,7 @@ export async function fetchFestivalProducts(): Promise<ProductCardData[]> {
     const seenIds = new Set<string>();
 
     if (taggedIds.length > 0) {
-      const { data: taggedProducts } = await liveProducts()
+      const { data: taggedProducts } = await liveProducts(storeId)
         .in("id", taggedIds)
         .order("featured", { ascending: false })
         .order("created_at", { ascending: false })
@@ -329,7 +344,7 @@ export async function fetchFestivalProducts(): Promise<ProductCardData[]> {
     }
 
     if (festivalCards.length < 8) {
-      const { data: textProducts } = await liveProducts()
+      const { data: textProducts } = await liveProducts(storeId)
         .or(
           "name.ilike.%diwali%,name.ilike.%light%,name.ilike.%lamp%,short_description.ilike.%diwali%,short_description.ilike.%light%",
         )
@@ -355,7 +370,9 @@ export async function fetchFestivalProducts(): Promise<ProductCardData[]> {
   }
 }
 
-export async function fetchAutoFestivalProductIds(): Promise<string[]> {
+export async function fetchAutoFestivalProductIds(
+  storeId: string = LEGACY_STORE_ID,
+): Promise<string[]> {
   try {
     const db = publicDb();
     const { data: tagRows } = await db
@@ -369,7 +386,7 @@ export async function fetchAutoFestivalProductIds(): Promise<string[]> {
     const seen = new Set<string>();
 
     if (taggedIds.length > 0) {
-      const { data } = await liveProducts()
+      const { data } = await liveProducts(storeId)
         .in("id", taggedIds)
         .order("featured", { ascending: false })
         .order("created_at", { ascending: false })
@@ -385,7 +402,7 @@ export async function fetchAutoFestivalProductIds(): Promise<string[]> {
     }
 
     if (ids.length < 8) {
-      const { data } = await liveProducts()
+      const { data } = await liveProducts(storeId)
         .or(
           "name.ilike.%diwali%,name.ilike.%light%,name.ilike.%lamp%,short_description.ilike.%diwali%,short_description.ilike.%light%",
         )
@@ -408,40 +425,57 @@ export async function fetchAutoFestivalProductIds(): Promise<string[]> {
   }
 }
 
-export const festivalQuery = queryOptions({
-  queryKey: ["festival", "diwali"],
-  queryFn: () => fetchFestivalProducts(),
-  staleTime: 60_000,
-});
+export function createFestivalQuery(storeId: string = LEGACY_STORE_ID) {
+  return queryOptions({
+    queryKey: ["festival", storeId],
+    queryFn: () => fetchFestivalProducts(storeId),
+    staleTime: 60_000,
+  });
+}
 
-export const homeQuery = queryOptions({
-  queryKey: ["home"],
-  queryFn: async () => {
-    try {
-      const [featured, newest, festival, all] = await Promise.all([
-        liveProducts().eq("featured", true).order("updated_at", { ascending: false }).limit(24),
-        liveProducts().order("created_at", { ascending: false }).limit(24),
-        fetchFestivalProducts(),
-        liveProducts().order("created_at", { ascending: false }).limit(500),
-      ]);
-      if (featured.error) throw featured.error;
-      if (newest.error) throw newest.error;
-      return {
-        featured: (featured.data as unknown as RawCard[]).map(toCard),
-        newest: (newest.data as unknown as RawCard[]).map(toCard),
-        festival,
-        allProducts: ((all.data ?? []) as unknown as RawCard[]).map(toCard),
-      };
-    } catch {
-      return {
-        featured: [],
-        newest: [],
-        festival: [],
-        allProducts: [],
-      };
-    }
-  },
-});
+export const festivalQuery = Object.assign(
+  (storeId: string = LEGACY_STORE_ID) => createFestivalQuery(storeId),
+  createFestivalQuery(LEGACY_STORE_ID),
+);
+
+export function createHomeQuery(storeId: string = LEGACY_STORE_ID) {
+  return queryOptions({
+    queryKey: ["home", storeId],
+    queryFn: async () => {
+      try {
+        const [featured, newest, festival, all] = await Promise.all([
+          liveProducts(storeId)
+            .eq("featured", true)
+            .order("updated_at", { ascending: false })
+            .limit(24),
+          liveProducts(storeId).order("created_at", { ascending: false }).limit(24),
+          fetchFestivalProducts(storeId),
+          liveProducts(storeId).order("created_at", { ascending: false }).limit(500),
+        ]);
+        if (featured.error) throw featured.error;
+        if (newest.error) throw newest.error;
+        return {
+          featured: ((featured.data ?? []) as unknown as RawCard[]).map(toCard),
+          newest: ((newest.data ?? []) as unknown as RawCard[]).map(toCard),
+          festival,
+          allProducts: ((all.data ?? []) as unknown as RawCard[]).map(toCard),
+        };
+      } catch {
+        return {
+          featured: [],
+          newest: [],
+          festival: [],
+          allProducts: [],
+        };
+      }
+    },
+  });
+}
+
+export const homeQuery = Object.assign(
+  (storeId: string = LEGACY_STORE_ID) => createHomeQuery(storeId),
+  createHomeQuery(LEGACY_STORE_ID),
+);
 
 export type ListParams = {
   q?: string | undefined;
@@ -570,7 +604,7 @@ export function computeProductRelevance(
   return score;
 }
 
-export async function listProducts(p: ListParams) {
+export async function listProducts(p: ListParams, storeId: string = LEGACY_STORE_ID) {
   const db = publicDb();
   const pageSize = p.pageSize ?? 24;
   const page = Math.max(1, p.page ?? 1);
@@ -618,11 +652,17 @@ export async function listProducts(p: ListParams) {
             .limit(500)
         : Promise.resolve({ data: [] as { product_id: string }[] }),
       searchTerms.length
-        ? db
-            .from("categories")
-            .select("id")
-            .or(searchTerms.map((w) => `name.ilike.%${w}%`).join(","))
-            .eq("active", true)
+        ? (() => {
+            let catQ = db
+              .from("categories")
+              .select("id")
+              .or(searchTerms.map((w) => `name.ilike.%${w}%`).join(","))
+              .eq("active", true);
+            if (storeId && storeId !== LEGACY_STORE_ID) {
+              catQ = catQ.eq("store_id", storeId);
+            }
+            return catQ;
+          })()
         : Promise.resolve({ data: [] as { id: string }[] }),
     ]);
 
@@ -639,30 +679,28 @@ export async function listProducts(p: ListParams) {
     if (tagProductIds.length) ors.push(`id.in.(${tagProductIds.slice(0, 100).join(",")})`);
     if (matchingCatIds.length) ors.push(`category_ids.ov.{${matchingCatIds.join(",")}}`);
 
-    let searchQuery = publicDb()
-      .from("products")
-      .select(SEARCH_SELECT)
-      .eq("active", true)
-      .is("deleted_at", null);
+    let searchQuery = liveProducts(storeId).select(SEARCH_SELECT);
 
     if (p.category) {
       const candidateSlugs = Array.from(
         new Set(
           [
             p.category,
-            LEGACY_CATEGORY_SLUG_MAP[p.category],
-            ...Object.entries(LEGACY_CATEGORY_SLUG_MAP)
-              .filter(([, target]) => target === p.category)
-              .map(([legacy]) => legacy),
+            storeId === LEGACY_STORE_ID ? LEGACY_CATEGORY_SLUG_MAP[p.category] : undefined,
+            ...(storeId === LEGACY_STORE_ID
+              ? Object.entries(LEGACY_CATEGORY_SLUG_MAP)
+                  .filter(([, target]) => target === p.category)
+                  .map(([legacy]) => legacy)
+              : []),
           ].filter(Boolean) as string[],
         ),
       );
 
-      const { data: matchedCats } = await db
-        .from("categories")
-        .select("id")
-        .in("slug", candidateSlugs)
-        .eq("active", true);
+      let catQ = db.from("categories").select("id").in("slug", candidateSlugs).eq("active", true);
+      if (storeId && storeId !== LEGACY_STORE_ID) {
+        catQ = catQ.eq("store_id", storeId);
+      }
+      const { data: matchedCats } = await catQ;
 
       const catIds = (matchedCats ?? []).map((c) => c.id);
       if (catIds.length === 0) return { items: [] as ProductCardData[], total: 0, page, pageSize };
@@ -721,26 +759,28 @@ export async function listProducts(p: ListParams) {
   // ----------------------------------------------------
   // STANDARD CATALOG BROWSING (when no search query is specified)
   // ----------------------------------------------------
-  let query = liveProducts();
+  let query = liveProducts(storeId);
 
   if (p.category) {
     const candidateSlugs = Array.from(
       new Set(
         [
           p.category,
-          LEGACY_CATEGORY_SLUG_MAP[p.category],
-          ...Object.entries(LEGACY_CATEGORY_SLUG_MAP)
-            .filter(([, target]) => target === p.category)
-            .map(([legacy]) => legacy),
+          storeId === LEGACY_STORE_ID ? LEGACY_CATEGORY_SLUG_MAP[p.category] : undefined,
+          ...(storeId === LEGACY_STORE_ID
+            ? Object.entries(LEGACY_CATEGORY_SLUG_MAP)
+                .filter(([, target]) => target === p.category)
+                .map(([legacy]) => legacy)
+            : []),
         ].filter(Boolean) as string[],
       ),
     );
 
-    const { data: matchedCats } = await db
-      .from("categories")
-      .select("id")
-      .in("slug", candidateSlugs)
-      .eq("active", true);
+    let catQ = db.from("categories").select("id").in("slug", candidateSlugs).eq("active", true);
+    if (storeId && storeId !== LEGACY_STORE_ID) {
+      catQ = catQ.eq("store_id", storeId);
+    }
+    const { data: matchedCats } = await catQ;
 
     const catIds = (matchedCats ?? []).map((c) => c.id);
     if (catIds.length === 0) return { items: [] as ProductCardData[], total: 0, page, pageSize };
@@ -776,46 +816,42 @@ export async function listProducts(p: ListParams) {
   return { items: (data as unknown as RawCard[]).map(toCard), total: count ?? 0, page, pageSize };
 }
 
-export const productsQuery = (p: ListParams) =>
-  queryOptions({ queryKey: ["products", p], queryFn: () => listProducts(p) });
+export const productsQuery = (p: ListParams, storeId: string = LEGACY_STORE_ID) =>
+  queryOptions({ queryKey: ["products", storeId, p], queryFn: () => listProducts(p, storeId) });
 
-export const categoryQuery = (slug: string) =>
+export const categoryQuery = (slug: string, storeId: string = LEGACY_STORE_ID) =>
   queryOptions({
-    queryKey: ["category", slug],
+    queryKey: ["category", storeId, slug],
     queryFn: async () => {
       const db = publicDb();
-      // 1. Try exact slug first
-      const { data, error } = await db
-        .from("categories")
-        .select("*")
-        .eq("slug", slug)
-        .eq("active", true)
-        .maybeSingle();
-      if (error) throw error;
+      const findCatBySlug = async (targetSlug: string) => {
+        let q = db.from("categories").select("*").eq("slug", targetSlug).eq("active", true);
+        if (storeId && storeId !== LEGACY_STORE_ID) {
+          q = q.eq("store_id", storeId);
+        }
+        const { data, error } = await q.maybeSingle();
+        if (error && error.code !== "42703") throw error;
+        return data;
+      };
+
+      // 1. Try exact slug first for this store
+      const data = await findCatBySlug(slug);
       if (data) return data;
 
-      // 2. Try forward legacy mapped slug (e.g. lights -> cosmic-lighting)
-      const mapped = LEGACY_CATEGORY_SLUG_MAP[slug];
-      if (mapped && mapped !== slug) {
-        const { data: mData } = await db
-          .from("categories")
-          .select("*")
-          .eq("slug", mapped)
-          .eq("active", true)
-          .maybeSingle();
-        if (mData) return mData;
-      }
+      // 2. Try forward legacy mapped slug (Tenant 0 only)
+      if (storeId === LEGACY_STORE_ID) {
+        const mapped = LEGACY_CATEGORY_SLUG_MAP[slug];
+        if (mapped && mapped !== slug) {
+          const mData = await findCatBySlug(mapped);
+          if (mData) return mData;
+        }
 
-      // 3. Try reverse mapped slugs (e.g. before migration is executed, cosmic-lighting -> lights)
-      for (const [legacy, target] of Object.entries(LEGACY_CATEGORY_SLUG_MAP)) {
-        if (target === slug) {
-          const { data: lData } = await db
-            .from("categories")
-            .select("*")
-            .eq("slug", legacy)
-            .eq("active", true)
-            .maybeSingle();
-          if (lData) return lData;
+        // 3. Try reverse mapped slugs (Tenant 0 only)
+        for (const [legacy, target] of Object.entries(LEGACY_CATEGORY_SLUG_MAP)) {
+          if (target === slug) {
+            const lData = await findCatBySlug(legacy);
+            if (lData) return lData;
+          }
         }
       }
 
@@ -823,17 +859,28 @@ export const categoryQuery = (slug: string) =>
     },
   });
 
-export async function fetchProductFull(slug: string): Promise<ProductFull | null> {
-  const { data, error } = await publicDb()
+export async function fetchProductFull(
+  slug: string,
+  storeId: string = LEGACY_STORE_ID,
+): Promise<ProductFull | null> {
+  let query = publicDb()
     .from("products")
     .select(
       `${CARD_SELECT},description,brand,retailer,retailer_product_id,price_updated_at,product_features(feature,sort_order),product_tags(tag)`,
     )
     .eq("slug", slug)
     .eq("active", true)
-    .is("deleted_at", null)
-    .maybeSingle();
-  if (error) throw error;
+    .is("deleted_at", null);
+
+  if (storeId && storeId !== LEGACY_STORE_ID) {
+    query = query.eq("store_id", storeId);
+  }
+
+  const { data, error } = await query.maybeSingle();
+  if (error) {
+    if (error.code === "42703") return null;
+    throw error;
+  }
   if (!data) return null;
   const r = data as unknown as RawCard & {
     category_id: string | null;
@@ -848,14 +895,21 @@ export async function fetchProductFull(slug: string): Promise<ProductFull | null
   };
   const imgs = [...(r.product_images ?? [])].sort((a, b) => a.sort_order - b.sort_order);
   const categoryIds = productCategoryIds(r);
+
+  let catQ = publicDb()
+    .from("categories")
+    .select("id,name,slug")
+    .in("id", categoryIds)
+    .eq("active", true);
+
+  if (storeId && storeId !== LEGACY_STORE_ID) {
+    catQ = catQ.eq("store_id", storeId);
+  }
+
   const { data: assigned, error: categoryError } = categoryIds.length
-    ? await publicDb()
-        .from("categories")
-        .select("id,name,slug")
-        .in("id", categoryIds)
-        .eq("active", true)
+    ? await catQ
     : { data: [], error: null };
-  if (categoryError) throw categoryError;
+  if (categoryError && categoryError.code !== "42703") throw categoryError;
   return {
     ...toCard(r),
     category_id: r.category_id,
@@ -877,23 +931,29 @@ export async function fetchProductFull(slug: string): Promise<ProductFull | null
   };
 }
 
-export const productQuery = (slug: string) =>
-  queryOptions({ queryKey: ["product", slug], queryFn: () => fetchProductFull(slug) });
-
-export const relatedQuery = (p: {
-  id: string;
-  category_id: string | null;
-  category_ids?: string[];
-  tags: string[];
-}) =>
+export const productQuery = (slug: string, storeId: string = LEGACY_STORE_ID) =>
   queryOptions({
-    queryKey: ["related", p.id, productCategoryIds(p), p.tags],
+    queryKey: ["product", storeId, slug],
+    queryFn: () => fetchProductFull(slug, storeId),
+  });
+
+export const relatedQuery = (
+  p: {
+    id: string;
+    category_id: string | null;
+    category_ids?: string[];
+    tags: string[];
+  },
+  storeId: string = LEGACY_STORE_ID,
+) =>
+  queryOptions({
+    queryKey: ["related", storeId, p.id, productCategoryIds(p), p.tags],
     queryFn: async () => {
       const db = publicDb();
       const out: ProductCardData[] = [];
       const categoryIds = productCategoryIds(p);
       if (categoryIds.length) {
-        const { data } = await liveProducts()
+        const { data } = await liveProducts(storeId)
           .overlaps("category_ids", categoryIds)
           .neq("id", p.id)
           .order("featured", { ascending: false })
@@ -910,14 +970,14 @@ export const relatedQuery = (p: {
           (id) => id !== p.id && !out.some((o) => o.id === id),
         );
         if (ids.length) {
-          const { data } = await liveProducts()
+          const { data } = await liveProducts(storeId)
             .in("id", ids.slice(0, 20))
             .limit(4 - out.length);
           out.push(...((data ?? []) as unknown as RawCard[]).map(toCard));
         }
       }
       if (out.length < 4) {
-        const { data } = await liveProducts().neq("id", p.id).eq("featured", true).limit(8);
+        const { data } = await liveProducts(storeId).neq("id", p.id).eq("featured", true).limit(8);
         for (const c of ((data ?? []) as unknown as RawCard[]).map(toCard)) {
           if (out.length >= 4) break;
           if (!out.some((o) => o.id === c.id)) out.push(c);
@@ -927,20 +987,24 @@ export const relatedQuery = (p: {
     },
   });
 
-export async function fetchCategoryQualityProducts(slug: string): Promise<ProductCardData[]> {
+export async function fetchCategoryQualityProducts(
+  slug: string,
+  storeId: string = LEGACY_STORE_ID,
+): Promise<ProductCardData[]> {
   try {
     const db = publicDb();
-    const { data: cat } = await db
-      .from("categories")
-      .select("id")
-      .eq("slug", slug)
-      .eq("active", true)
-      .maybeSingle();
+    let catQ = db.from("categories").select("id").eq("slug", slug).eq("active", true);
+
+    if (storeId && storeId !== LEGACY_STORE_ID) {
+      catQ = catQ.eq("store_id", storeId);
+    }
+
+    const { data: cat } = await catQ.maybeSingle();
 
     if (!cat) return [];
 
     // Prioritize explicitly featured products in this category
-    const { data: featuredData } = await liveProducts()
+    const { data: featuredData } = await liveProducts(storeId)
       .contains("category_ids", [cat.id])
       .eq("featured", true)
       .order("created_at", { ascending: false })
@@ -951,7 +1015,7 @@ export async function fetchCategoryQualityProducts(slug: string): Promise<Produc
 
     // If fewer than 4, fill remaining slots with the latest products in this category
     if (cards.length < 4) {
-      const { data: moreData } = await liveProducts()
+      const { data: moreData } = await liveProducts(storeId)
         .contains("category_ids", [cat.id])
         .order("created_at", { ascending: false })
         .limit(8);
@@ -974,19 +1038,23 @@ export async function fetchCategoryQualityProducts(slug: string): Promise<Produc
   }
 }
 
-export const categoryQualityProductsQuery = (slug: string) =>
+export const categoryQualityProductsQuery = (slug: string, storeId: string = LEGACY_STORE_ID) =>
   queryOptions({
-    queryKey: ["category-quality-products", slug],
-    queryFn: () => fetchCategoryQualityProducts(slug),
+    queryKey: ["category-quality-products", storeId, slug],
+    queryFn: () => fetchCategoryQualityProducts(slug, storeId),
     staleTime: 60_000,
   });
 
 /** Fire-and-forget outbound affiliate click log. Never blocks navigation. */
-export function logOutboundClick(productId: string) {
+export function logOutboundClick(productId: string, storeId: string = LEGACY_STORE_ID) {
   try {
+    const payload: { product_id: string; store_id?: string } = { product_id: productId };
+    if (storeId && storeId !== LEGACY_STORE_ID) {
+      payload.store_id = storeId;
+    }
     void publicDb()
       .from("outbound_clicks")
-      .insert({ product_id: productId })
+      .insert(payload as unknown as { product_id: string })
       .then(() => undefined);
   } catch {
     /* ignore */
